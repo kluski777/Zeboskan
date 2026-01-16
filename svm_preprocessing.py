@@ -75,81 +75,116 @@ def get_teeth_positions(image_metadata_record: dict) -> list[np.ndarray]:
             teeth.append(np.array(tooth_pos['points']['exterior']))
     return teeth
 
-def return_segments(preprocessed, cfg):
-    # KSIZE=7 JEST KLUCZOWE
-    x_deriv = cv2.Sobel(preprocessed, cv2.CV_64F, 1, 0, ksize=cfg['sobel_ksize'])
-    y_deriv = cv2.Sobel(preprocessed, cv2.CV_64F, 0, 1, ksize=cfg['sobel_ksize'])
 
-    y_range = np.arange(cfg['y_top_limit'], preprocessed.shape[0] - cfg['y_bot_limit'])
-    y_center, img_w = y_range.mean(), preprocessed.shape[1]
-    x_positions = np.arange(cfg['x_left_limit'], img_w - cfg['x_right_limit'], cfg['x_step'])
+def return_segments(preprocessed, cfg: dict):
+    x_deriv = cv2.Sobel(preprocessed, cv2.CV_64F, 1, 0, ksize=7)
+    y_deriv = cv2.Sobel(preprocessed, cv2.CV_64F, 0, 1, ksize=7)
+
+    # Search Space Setup
+    x_positions = np.arange(cfg['x_left_limit'], preprocessed.shape[1] - cfg['x_right_limit'], cfg['x_step'])
     angles = np.radians(np.linspace(-cfg['angle_range'], cfg['angle_range'], cfg['angle_steps']))
+    y_range = np.arange(cfg['y_bot_limit'], preprocessed.shape[0] - cfg['y_top_limit'])
+    y_center = y_range.mean()
+    image_width = preprocessed.shape[1]
 
+    # Calculate Node Costs
     node_costs = np.zeros((len(x_positions), len(angles)))
-    for xi, x_pos in enumerate(x_positions):
-        for ai, ang in enumerate(angles):
-            line_x = np.clip(np.tan(ang)*(y_range - y_center) + x_pos, 0, img_w-1).astype(int)
-            # PRZYWRÓCONE: Tylko abs(x_deriv) dla linii pionowych!
-            grad_m = np.abs(x_deriv[y_range, line_x]).mean() 
-            node_costs[xi, ai] = (cfg['alpha'] * preprocessed[y_range, line_x].mean() + 
-                                cfg['beta'] * preprocessed[y_range, line_x].std() + 
-                                cfg['gamma'] / (grad_m**2 + cfg['eps']) + 
-                                cfg['delta'] * abs(ang))
+    for x_idx, x_pos in enumerate(x_positions):
+        for angle_idx, angle in enumerate(angles):
+            line_x = np.clip(np.tan(angle)*(y_range - y_center) + x_pos, 0, image_width-1).astype(int)
+            gradient_intensity = np.abs(x_deriv[y_range, line_x]).mean()
+            node_costs[x_idx, angle_idx] =  cfg['alpha'] * preprocessed[y_range, line_x].mean() + \
+                                            cfg['beta'] * preprocessed[y_range, line_x].std() + \
+                                            cfg['gamma'] / (gradient_intensity**2 + cfg['eps']) + \
+                                            cfg['delta'] * abs(angle)
 
     dp = np.full((cfg['num_planes'], len(x_positions), len(angles)), np.inf)
-    backtrack = np.zeros_like(dp, dtype=int)
+    backpointers = np.zeros((cfg['num_planes'], len(x_positions), len(angles), 2), dtype=int)
+
     dp[0, :len(x_positions)//4] = node_costs[:len(x_positions)//4]
 
-    for p in range(1, cfg['num_planes']):
-        for i in range(len(x_positions)):
-            prev_idx = np.where(x_positions[i] - x_positions[:i] >= cfg['min_gap_pixels'])[0]
-            if prev_idx.size == 0: 
+    for plane in range(1, cfg['num_planes']):
+        for curr_x_idx, curr_x_pos in enumerate(x_positions):
+            valid_prev_x_indices = np.where(curr_x_pos - x_positions[:curr_x_idx] >= cfg['min_gap_pixels'])[0]
+            
+            if valid_prev_x_indices.size == 0:
                 continue
-            best_px = prev_idx[np.argmin(dp[p-1, prev_idx].min(axis=1))]
-            dp[p, i, :] = dp[p-1, best_px].min() + node_costs[i, :]
-            backtrack[p, i, :] = best_px
+            
+            prev_plane_costs = dp[plane-1, valid_prev_x_indices]
+            best_prev_x_local, best_prev_angle = np.unravel_index(
+                np.argmin(prev_plane_costs), 
+                prev_plane_costs.shape
+            )
+            best_prev_x_idx = valid_prev_x_indices[best_prev_x_local]
+            
+            dp[plane, curr_x_idx, :] = prev_plane_costs[best_prev_x_local, best_prev_angle] + node_costs[curr_x_idx, :]
+            backpointers[plane, curr_x_idx, :, 0] = best_prev_x_idx
+            backpointers[plane, curr_x_idx, :, 1] = best_prev_angle
 
-    curr_x = np.argmin(dp[-1].min(axis=1))
+    curr_x_idx, curr_angle_idx = np.unravel_index(np.argmin(dp[-1]), (len(x_positions), len(angles)))
+
     lines = []
-    for p in range(cfg['num_planes']-1, -1, -1):
-        lines.append((np.tan(angles[0]) * (y_range - y_center) + x_positions[curr_x]).astype(int))
-        curr_x = backtrack[p, curr_x, 0]
+    for plane in range(cfg['num_planes']-1, -1, -1):
+        lines.append( 
+            (np.tan(angles[curr_angle_idx]) * (y_range - y_center) + x_positions[curr_x_idx]).astype(int) 
+        )
+        
+        next_x = backpointers[plane, curr_x_idx, curr_angle_idx, 0]
+        next_a = backpointers[plane, curr_x_idx, curr_angle_idx, 1]
+        curr_x_idx, curr_angle_idx = next_x, next_a
 
-    # SEPARACJA POZIOMA (OCLLUSAL) - Tutaj magnitude jest ok
-    mag = np.sqrt(x_deriv**2 + y_deriv**2)
-    y_dn, y_up = int(preprocessed.shape[0] * cfg['y_occl_down']), int(preprocessed.shape[0] * cfg['y_occl_up'])
-    roi_costs = cfg['alpha'] * preprocessed[y_dn:y_up, :] + cfg['gamma'] / (mag[y_dn:y_up, :]**2 + cfg['eps'])
+    lines = np.array(lines)
+
+    x_grid = np.arange(image_width)
+
+    label_map = np.zeros((len(y_range), image_width), dtype=np.uint8)
+
+    for line_x in lines:
+        label_map += (x_grid > line_x[:, np.newaxis])
+
+    alpha_h, gamma_h = 1.0, 1000.0  # Weights for Intensity and Gradient
+    grad_mag = np.sqrt(x_deriv**2 + y_deriv**2)
+
+    # Focus search on the middle 1/3 of the image height to avoid jawbone
+    y_start, y_end = preprocessed.shape[0]//3, 2*preprocessed.shape[0]//3
+    roi_costs = alpha_h * preprocessed[y_start:y_end, :] + gamma_h / (grad_mag[y_start:y_end, :]**2 + cfg['eps'])
 
     rows, cols = roi_costs.shape
-    dp_h, bt_h = np.full((rows, cols), np.inf), np.zeros((rows, cols), dtype=int)
+    dp_h = np.full((rows, cols), np.inf)
+    backtrack_h = np.zeros((rows, cols), dtype=int)
+
     dp_h[:, 0] = roi_costs[:, 0]
-    
+
     for x in range(1, cols):
-        L = dp_h[:, x-1]
-        stack = np.stack([np.r_[L[1:], np.inf], L, np.r_[np.inf, L[:-1]]])
-        best = np.argmin(stack, axis=0)
-        dp_h[:, x] = roi_costs[:, x] + stack[best, np.arange(rows)]
-        bt_h[:, x] = np.clip(np.arange(rows) + (best - 1), 0, rows-1)
+        for y in range(rows):
+            # Constraint: Path can only move up 1, down 1, or stay at the same Y
+            prev_y_range = np.arange(max(0, y-1), min(rows, y+2))
+            prev_costs = dp_h[prev_y_range, x-1]
+            
+            best_prev_idx = np.argmin(prev_costs)
+            dp_h[y, x] = prev_costs[best_prev_idx] + roi_costs[y, x]
+            backtrack_h[y, x] = prev_y_range[best_prev_idx]
 
-    curve = np.zeros(cols, dtype=int)
-    curve[-1] = np.argmin(dp_h[:, -1])
-    for x in range(cols-1, 0, -1): # <--- TU BYŁ BŁĄD, TERAZ JEST COLS
-        curve[x-1] = bt_h[curve[x], x]
-    curve += y_dn
+    occlusal_curve = np.zeros(cols, dtype=int)
+    occlusal_curve[-1] = np.argmin(dp_h[:, -1])
 
-    # Generowanie finalnej mapy (używamy img_w z góry funkcji)
-    label_map = np.zeros((len(y_range), img_w), dtype=np.uint8)
-    for lx in lines: 
-        label_map += (np.arange(img_w) > lx[:, None])
-    
-    y_coords, x_coords = np.indices((len(y_range), img_w))
-    is_lower = (y_coords + cfg['y_top_limit']) > curve[x_coords]
-    
+    for x in range(cols-1, 0, -1):
+        occlusal_curve[x-1] = backtrack_h[occlusal_curve[x], x]
+
+    # Adjust back to global image coordinates
+    occlusal_curve += y_start
+
+    x_coords, y_coords = np.indices(preprocessed.shape)
+    x_coords = x_coords[y_range, :] # dla 0 nie dziala
+    y_coords = y_coords[y_range, :]
+    is_lower = x_coords > occlusal_curve[y_coords]
+
     return label_map + (is_lower * 16)
+
 
 def extract_dense_point_profile(points, roi_image, cfg):
     pts = np.float32(points).reshape(-1, 2)
-    coords = pts.astype(int)
+    # coords = pts.astype(int)
     h, w = roi_image.shape
     y_idx, x_idx = np.clip(coords[:, 1], 0, h-1), np.clip(coords[:, 0], 0, w-1)
     
