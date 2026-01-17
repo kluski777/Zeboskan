@@ -183,10 +183,9 @@ def return_segments(preprocessed, cfg: dict):
 
 
 def extract_dense_point_profile(points, roi_image, cfg):
-    pts = np.float32(points).reshape(-1, 2)
-    # coords = pts.astype(int)
+    pts = np.float32(points).reshape(-1, 2).astype(int)
     h, w = roi_image.shape
-    y_idx, x_idx = np.clip(coords[:, 1], 0, h-1), np.clip(coords[:, 0], 0, w-1)
+    y_idx, x_idx = np.clip(pts[:, 1], 0, h-1), np.clip(pts[:, 0], 0, w-1)
     
     lx = cv2.Sobel(roi_image, cv2.CV_64F, 1, 0, ksize=cfg['sobel_ksize_local'])
     ly = cv2.Sobel(roi_image, cv2.CV_64F, 0, 1, ksize=cfg['sobel_ksize_local'])
