@@ -3,6 +3,8 @@ from skimage.graph import rag_mean_color, cut_threshold
 from skimage.segmentation import slic, mark_boundaries
 from skimage.segmentation import felzenszwalb
 from skimage.filters import gaussian, sobel
+from scipy.spatial.distance import cdist
+from scipy.spatial import Voronoi
 import matplotlib.pyplot as plt
 from skimage.draw import ellipse
 from collections import deque
@@ -20,7 +22,7 @@ def get_teeth_positions(image_metadata_record: dict) -> list[np.ndarray]:
 
 
 
-#! SLIC i FELZENSZWALB NIE DZIALAJA WCALE
+#! NIE UZYWAC SLICA JEST ZA WOLNY
 def segment_teeth_slic(preprocessed_img, n_segments=30, compactness=5, threshold=0.1):
     """SLIC superpixels → RAG merge → same output format as watershed."""
     # Binarize to mask out background
@@ -54,7 +56,7 @@ def segment_teeth_slic(preprocessed_img, n_segments=30, compactness=5, threshold
     return teeth_mask, np.array(contours, dtype=object), markers
 
 
-#! SLIC i FELZENSZWALB NIE DZIALAJA WCALE
+#! FELZENSZWALB DAJE DZIWNE WYNIKI
 def segment_teeth_felzenszwalb(preprocessed_img, scale=10, sigma=1.5, min_size=50, downscale=2):
     h, w = preprocessed_img.shape
     small = cv2.resize(preprocessed_img, (w // downscale, h // downscale))
@@ -172,292 +174,180 @@ def _contour_overlay(img, contours):
     return overlay
 
 
-# ============================================================================
-# METODA 1: MARKER-BASED WATERSHED
-# ============================================================================
+def segment_with_voronoi(preprocessed_img, centroids, refine=True, min_area=800, max_area=16000, debug=False):
+    """
+    Podział Voronoi na podstawie centroidów + opcjonalne ograniczenie do zębów.
 
-def segment_with_marker_watershed(preprocessed_img, centroids, marker_radius=10, debug=False):
-    """Watershed z centroidami jako markerami."""
-    markers, mapping, next_lbl = _make_markers(preprocessed_img.shape, centroids, marker_radius)
-    bg, _ = _bg_mask(preprocessed_img)
-    markers[bg > 0] = next_lbl
-
-    color_img = cv2.cvtColor(preprocessed_img, cv2.COLOR_GRAY2BGR)
-    result = markers.copy()
-    cv2.watershed(color_img, result)
-    contours = _extract_contours(result, mapping)
-
-    if debug:
-        _debug_panels([
-            (markers, 'Initial Markers', 'nipy_spectral'),
-            (result, 'After Watershed', 'nipy_spectral'),
-            (_contour_overlay(preprocessed_img, contours), f'Contours: {len(contours)} teeth', None),
-        ])
-    return contours, result
-
-
-# ============================================================================
-# METODA 2: REGION GROWING
-# ============================================================================
-
-def _region_grow_single(img, seed, threshold=15, max_iter=10000):
-    """Region growing z pojedynczego seeda."""
-    h, w = img.shape
-    sx, sy = int(seed[0]), int(seed[1])
-    if not (0 <= sx < w and 0 <= sy < h):
-        return None
-
-    mask = np.zeros((h, w), dtype=np.uint8)
-    nb = img[max(0, sy-3):min(h, sy+4), max(0, sx-3):min(w, sx+4)]
-    ref = np.mean(nb)
-
-    queue = deque([(sx, sy)])
-    visited = {(sx, sy)}
-    for _ in range(max_iter):
-        if not queue:
-            break
-        x, y = queue.popleft()
-        if abs(float(img[y, x]) - ref) <= threshold:
-            mask[y, x] = 255
-            for dx, dy in [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]:
-                nx, ny = x+dx, y+dy
-                if 0 <= nx < w and 0 <= ny < h and (nx, ny) not in visited:
-                    visited.add((nx, ny))
-                    queue.append((nx, ny))
-    return mask
-
-
-def segment_with_region_growing(preprocessed_img, centroids, threshold=20, debug=False):
-    """Segmentacja przez region growing z każdego centroidu."""
+    Zalety:
+    - Bardzo szybka
+    - Zawsze daje wynik dla każdego centroidu
+    - Naturalny podział przestrzeni
+    """
     h, w = preprocessed_img.shape
-    all_masks = np.zeros((h, w), dtype=np.int32)
-    contours = {}
-    smoothed = cv2.GaussianBlur(preprocessed_img, (5, 5), 1)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+
+    # 1. Przygotuj punkty dla Voronoi (dodaj punkty brzegowe)
+    points = []
+    tooth_ids = []
 
     for tid, (cx, cy) in centroids.items():
-        mask = _region_grow_single(smoothed, (cx, cy), threshold)
-        if mask is None or mask.sum() < 100:
-            continue
-        mask = cv2.morphologyEx(cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel), cv2.MORPH_OPEN, kernel)
-        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in cnts:
-            if cv2.pointPolygonTest(cnt, (cx, cy), False) >= 0:
-                contours[tid] = cnt
-                all_masks[mask > 0] = tid
-                break
-
-    if debug:
-        _debug_panels([
-            (all_masks, 'Region Growing Masks', 'nipy_spectral'),
-            (_contour_overlay(preprocessed_img, contours), f'Region Growing: {len(contours)} teeth', None),
-        ], figsize=(14, 6))
-    return contours, all_masks
-
-
-# ============================================================================
-# METODA 3: GRABCUT
-# ============================================================================
-
-def segment_with_grabcut(preprocessed_img, centroids, bbox_scale=1.5, debug=False):
-    """GrabCut z bounding boxami wokół centroidów."""
-    color_img = cv2.cvtColor(preprocessed_img, cv2.COLOR_GRAY2BGR) if preprocessed_img.ndim == 2 else preprocessed_img.copy()
-    h, w = preprocessed_img.shape[:2]
-    contours = {}
-    half_w, half_h = int(w / 16 * bbox_scale / 2), int(h / 4 * bbox_scale / 2)
-
-    for tid, (cx, cy) in centroids.items():
-        cx, cy = int(cx), int(cy)
-        x1, y1 = max(0, cx-half_w), max(0, cy-half_h)
-        x2, y2 = min(w, cx+half_w), min(h, cy+half_h)
-        rect = (x1, y1, x2-x1, y2-y1)
-        if rect[2] < 20 or rect[3] < 20:
-            continue
-        try:
-            mask = np.zeros((h, w), np.uint8)
-            cv2.grabCut(color_img, mask, rect, np.zeros((1,65), np.float64),
-                        np.zeros((1,65), np.float64), 5, cv2.GC_INIT_WITH_RECT)
-            result = np.where((mask == 2) | (mask == 0), 0, 255).astype(np.uint8)
-            cnts, _ = cv2.findContours(result, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if cnts:
-                best = max(cnts, key=cv2.contourArea)
-                if cv2.contourArea(best) > 500:
-                    contours[tid] = best
-        except cv2.error:
-            continue
-
-    if debug:
-        _debug_panels([
-            (_contour_overlay(preprocessed_img, contours), f'GrabCut: {len(contours)} teeth', None),
-        ], figsize=(12, 8))
-    return contours
-
-
-# ============================================================================
-# METODA 4: ACTIVE CONTOURS (SNAKES)
-# ============================================================================
-
-def segment_with_active_contours(preprocessed_img, centroids, initial_radius=30,
-                                alpha=0.01, beta=0.1, gamma=0.01, debug=False):
-    """Active Contours (Snakes) inicjalizowane okręgami wokół centroidów."""
-    h, w = preprocessed_img.shape
-    img_norm = gaussian(preprocessed_img.astype(float), sigma=2)
-    img_norm = (img_norm - img_norm.min()) / (img_norm.max() - img_norm.min())
-    edge_map = sobel(img_norm)
-    contours = {}
-
-    s = np.linspace(0, 2 * np.pi, 100)
-    for tid, (cx, cy) in centroids.items():
-        init_x, init_y = cx + initial_radius * np.cos(s), cy + initial_radius * np.sin(s)
-        if init_x.min() < 0 or init_x.max() >= w or init_y.min() < 0 or init_y.max() >= h:
-            continue
-        try:
-            snake = active_contour(edge_map, np.column_stack([init_x, init_y]),
-                                    alpha=alpha, beta=beta, gamma=gamma,
-                                    max_num_iter=500, convergence=0.1)
-            cnt = snake.astype(np.int32).reshape(-1, 1, 2)
-            area = cv2.contourArea(cnt)
-            if 500 < area < 50000:
-                contours[tid] = cnt
-        except Exception:
-            continue
-
-    if debug:
-        _debug_panels([
-            (edge_map, 'Edge Map (Sobel)', 'gray'),
-            (_contour_overlay(preprocessed_img, contours), f'Active Contours: {len(contours)} teeth', None),
-        ], figsize=(14, 6))
-    return contours
-
-
-# ============================================================================
-# METODA 5: RANDOM WALKER
-# ============================================================================
-
-def segment_with_random_walker(preprocessed_img, centroids, marker_radius=8, beta=130, debug=False):
-    """Random Walker segmentation - probabilistyczna metoda."""
-    markers, mapping, next_lbl = _make_markers(preprocessed_img.shape, centroids, marker_radius)
-    bg, _ = _bg_mask(preprocessed_img, kernel_size=20)
-    markers[bg > 0] = next_lbl
-
-    try:
-        labels = random_walker(preprocessed_img.astype(float) / 255.0, markers, beta=beta, mode='bf')
-    except Exception as e:
-        print(f"Random Walker error: {e}")
-        return {}, markers
-
-    contours = _extract_contours(labels, mapping)
-
-    if debug:
-        _debug_panels([
-            (markers, 'Markers (seeds)', 'nipy_spectral'),
-            (labels, 'Random Walker Result', 'nipy_spectral'),
-            (_contour_overlay(preprocessed_img, contours), f'Contours: {len(contours)} teeth', None),
-        ])
-    return contours, labels
-
-
-# ============================================================================
-# METODA 6: DISTANCE TRANSFORM + WATERSHED
-# ============================================================================
-
-def segment_with_distance_watershed(preprocessed_img, centroids, debug=False):
-    """Ulepszona watershed wykorzystująca distance transform i centroidy."""
-    h, w = preprocessed_img.shape
-    _, binary = cv2.threshold(preprocessed_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    binary = cv2.morphologyEx(cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel), cv2.MORPH_OPEN, kernel)
-
-    dist = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
-
-    # Markery z centroidów — promień proporcjonalny do distance transform
-    markers = np.zeros((h, w), dtype=np.int32)
-    mapping = {}
-    label = 1
-    for tid, (cx, cy) in centroids.items():
-        cx, cy = int(cx), int(cy)
         if 0 <= cx < w and 0 <= cy < h:
-            radius = max(5, int(dist[cy, cx] * 0.5))
-            cv2.circle(markers, (cx, cy), radius, label, -1)
-            mapping[tid] = label
-            label += 1
-    markers[binary == 0] = label
+            points.append([cx, cy])
+            tooth_ids.append(tid)
 
-    # Watershed na odwróconej distance transform
-    dist_inv = cv2.normalize(dist.max() - dist, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    result = markers.copy()
-    cv2.watershed(cv2.cvtColor(dist_inv, cv2.COLOR_GRAY2BGR), result)
-    contours = _extract_contours(result, mapping)
+    if len(points) < 3:
+        return {}, np.zeros((h, w), dtype=np.int32)
+
+    # Dodaj punkty na rogach (żeby Voronoi był skończony)
+    margin = 50
+    corner_points = [
+        [-margin, -margin], [w + margin, -margin],
+        [-margin, h + margin], [w + margin, h + margin],
+        [w/2, -margin], [w/2, h + margin],
+        [-margin, h/2], [w + margin, h/2]
+    ]
+    all_points = np.array(points + corner_points)
+
+    # 2. Oblicz Voronoi
+    vor = Voronoi(all_points)
+
+    # 3. Utwórz mapę regionów
+    # Dla każdego piksela znajdź najbliższy centroid
+    xx, yy = np.meshgrid(np.arange(w), np.arange(h))
+    pixel_coords = np.stack([xx.ravel(), yy.ravel()], axis=1)
+
+    # Oblicz odległości do każdego centroidu
+    centroids_arr = np.array(points)
+
+    # Znajdź najbliższy centroid dla każdego piksela
+    from scipy.spatial.distance import cdist
+    distances = cdist(pixel_coords, centroids_arr)
+    nearest_idx = np.argmin(distances, axis=1)
+
+    voronoi_map = nearest_idx.reshape(h, w)
+
+    # 4. Opcjonalne: ogranicz do obszaru zębów (binaryzacja)
+    if refine:
+        _, binary = cv2.threshold(preprocessed_img, 0, 255,
+                                   cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Cleanup
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+
+        # Maskuj regiony Voronoi
+        voronoi_map_refined = voronoi_map.copy()
+        voronoi_map_refined[binary == 0] = -1  # tło
+    else:
+        voronoi_map_refined = voronoi_map
+
+    # 5. Wyodrębnij kontury
+    teeth_contours = {}
+
+    for i, tid in enumerate(tooth_ids):
+        tooth_mask = (voronoi_map_refined == i).astype(np.uint8) * 255
+
+        contours, _ = cv2.findContours(tooth_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if contours:
+            valid_contours = []
+
+            cx, cy = int(centroids[tid][0]), int(centroids[tid][1])
+
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if min_area <= area <= max_area:
+                    if cv2.pointPolygonTest(cnt, (cx, cy), False) >= 0:
+                        valid_contours.append(cnt)
+
+            if valid_contours:
+                best_cnt = max(valid_contours, key=cv2.contourArea)
+                teeth_contours[tid] = best_cnt
+            else:
+                largest = max(contours, key=cv2.contourArea)
+                area = cv2.contourArea(largest)
+                if area > max_area:
+                    print(f"Ząb {tid} obcięty odległością od centroidu: {area:.0f} → {max_area}")
+
+                    # Tworzymy maskę tylko z największego konturu
+                    mask_temp = np.zeros_like(tooth_mask)
+                    cv2.drawContours(mask_temp, [largest], -1, 255, -1)
+
+                    # Obliczamy odległość euklidesową od centroidu (ręcznie, bo distanceTransform jest od krawędzi)
+                    yy, xx = np.mgrid[0:h, 0:w]
+                    dist_from_center = np.sqrt((xx - cx)**2 + (yy - cy)**2)
+
+                    # Tworzymy nową maskę – tylko piksele bliżej niż max_dist
+                    max_dist = np.sqrt(max_area / np.pi) * 1.5  # promień koła + zapas
+
+                    tooth_mask = np.where(
+                        (mask_temp > 0) & (dist_from_center <= max_dist),
+                        255,
+                        0
+                    ).astype(np.uint8)
+
+                    # Ponownie znajdujemy kontury po obcięciu
+                    contours, _ = cv2.findContours(tooth_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    if contours:
+                        teeth_contours[tid] = max(contours, key=cv2.contourArea)
+                    else:
+                        # Jeśli po obcięciu nic nie zostało – zostawiamy oryginalny (rzadkie)
+                        teeth_contours[tid] = largest
 
     if debug:
-        panels = [
-            (binary, 'Binary', 'gray'),
-            (dist, 'Distance Transform', 'hot'),
-            (markers, 'Initial Markers', 'nipy_spectral'),
-            (dist_inv, 'Inverted Distance', 'gray'),
-            (result, 'After Watershed', 'nipy_spectral'),
-            (_contour_overlay(preprocessed_img, contours), f'Result: {len(contours)} teeth', None),
-        ]
-        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-        for ax, (img, title, cmap) in zip(axes.flat, panels):
-            ax.imshow(img, cmap=cmap)
-            ax.set_title(title)
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+        axes[0].imshow(voronoi_map, cmap='nipy_spectral')
+        axes[0].set_title('Voronoi Partition')
+
+        if refine:
+            axes[1].imshow(voronoi_map_refined, cmap='nipy_spectral')
+            axes[1].set_title('Voronoi + Binary Mask')
+        else:
+            axes[1].imshow(preprocessed_img, cmap='gray')
+            axes[1].set_title('Original')
+
+        overlay = cv2.cvtColor(preprocessed_img, cv2.COLOR_GRAY2BGR)
+        for tid, cnt in teeth_contours.items():
+            cv2.drawContours(overlay, [cnt], -1, (0, 255, 0), 2)
+        axes[2].imshow(overlay)
+        axes[2].set_title(f'Voronoi Contours: {len(teeth_contours)} teeth')
+
+        for ax in axes:
             ax.axis('off')
         plt.tight_layout()
         plt.show()
 
-    return contours, result
+    return teeth_contours, voronoi_map_refined
 
+def segment_with_mean_shift(preprocessed_img, centroids, sp=15, sr=30, debug=False):
+    """
+    Mean Shift clustering/segmentation.
 
-# ============================================================================
-# PORÓWNANIE WSZYSTKICH METOD
-# ============================================================================
+    Zalety:
+    - Automatycznie znajduje liczbę klastrów
+    - Dobre dla regionów o podobnej teksturze
+    """
+    h, w = preprocessed_img.shape
+    img_color = cv2.cvtColor(preprocessed_img, cv2.COLOR_GRAY2BGR)
+    shifted = cv2.pyrMeanShiftFiltering(img_color, sp=sp, sr=sr)
+    shifted_gray = cv2.cvtColor(shifted, cv2.COLOR_BGR2GRAY)
 
-def compare_all_segmentation_methods(preprocessed_img, centroids, gt_metadata=None):
-    """Porównuje wszystkie metody segmentacji na jednym obrazie."""
-    methods = {
-        'Marker Watershed': lambda: segment_with_marker_watershed(preprocessed_img, centroids),
-        'Region Growing': lambda: segment_with_region_growing(preprocessed_img, centroids),
-        'GrabCut': lambda: segment_with_grabcut(preprocessed_img, centroids),
-        'Active Contours': lambda: segment_with_active_contours(preprocessed_img, centroids),
-        'Random Walker': lambda: segment_with_random_walker(preprocessed_img, centroids),
-        'Distance Watershed': lambda: segment_with_distance_watershed(preprocessed_img, centroids),
-    }
+    _, binary = cv2.threshold(shifted_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    fig, axes = plt.subplots(2, 4, figsize=(24, 12))
-    axes = axes.flatten()
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
-    # Oryginalny obraz z centroidami
-    overlay = cv2.cvtColor(preprocessed_img, cv2.COLOR_GRAY2BGR)
-    for tid, (cx, cy) in centroids.items():
-        cv2.circle(overlay, (int(cx), int(cy)), 5, (255, 0, 0), -1)
-        cv2.putText(overlay, str(tid), (int(cx)+5, int(cy)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
-    axes[0].imshow(overlay)
-    axes[0].set_title(f'Centroids ({len(centroids)} teeth)')
-    axes[0].axis('off')
+    teeth_contours, _ = segment_with_voronoi(shifted_gray, centroids, refine=True, debug=False)
 
-    start = 1
-    if gt_metadata:
-        axes[1].imshow(draw_annotations(preprocessed_img.copy(), gt_metadata, color=(255,0,0), thickness=2))
-        axes[1].set_title('Ground Truth')
-        axes[1].axis('off')
-        start = 2
+    if debug:
+        vis = cv2.cvtColor(preprocessed_img, cv2.COLOR_GRAY2BGR)
+        cv2.drawContours(vis, list(teeth_contours.values()), -1, (0, 255, 0), 2)
+        plt.figure(figsize=(10,8))
+        plt.imshow(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
+        plt.title(f'v1 - Twoja wersja: {len(teeth_contours)} zębów')
+        plt.axis('off')
+        plt.show()
 
-    results = {}
-    for i, (name, method) in enumerate(methods.items()):
-        ax = axes[start + i]
-        try:
-            res = method()
-            contours = res[0] if isinstance(res, tuple) else res
-            results[name] = contours
-            ax.imshow(_contour_overlay(preprocessed_img, contours))
-            ax.set_title(f'{name}\n({len(contours)} teeth)')
-        except Exception as e:
-            ax.text(0.5, 0.5, f'Error:\n{str(e)[:50]}', ha='center', va='center', transform=ax.transAxes)
-            ax.set_title(f'{name}\n(FAILED)')
-            results[name] = {}
-        ax.axis('off')
-
-    plt.tight_layout()
-    plt.show()
-    return results
+    return teeth_contours, shifted_gray
