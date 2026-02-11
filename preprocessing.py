@@ -41,12 +41,12 @@ def preprocess_dental_xray(image):
     preprocessed_img = image.copy()
 
     # 1. Bilateral Filtration - removes noise, preserves edges
-    denoised = cv2.bilateralFilter(preprocessed_img, 9, 80, 80)
+    # denoised = cv2.bilateralFilter(preprocessed_img, 9, 80, 80)
 
     # 2. Morphological Top-Hat Transformation (White-Hat)
-    kernel_size = (100, 70)
+    kernel_size = (80, 60)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, kernel_size)
-    tophat = cv2.morphologyEx(denoised, cv2.MORPH_TOPHAT, kernel)
+    tophat = cv2.morphologyEx(preprocessed_img, cv2.MORPH_TOPHAT, kernel)
 
     tophat = cv2.normalize(tophat, None, 0, 255, cv2.NORM_MINMAX)
 

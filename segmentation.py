@@ -21,70 +21,17 @@ def get_teeth_positions(image_metadata_record: dict) -> list[np.ndarray]:
     return teeth
 
 
-
-#! NIE UZYWAC SLICA JEST ZA WOLNY
-def segment_teeth_slic(preprocessed_img, n_segments=30, compactness=5, threshold=0.1):
-    """SLIC superpixels → RAG merge → same output format as watershed."""
-    # Binarize to mask out background
-    _, binary = cv2.threshold(preprocessed_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-
-    # SLIC needs float [0,1] input
-    img_float = preprocessed_img.astype(float) / 255.0
-    slic_labels = slic( img_float, n_segments=n_segments, compactness=compactness,
-                        start_label=1, channel_axis=None)
-
-    # Zero out background superpixels
-    slic_labels[binary == 0] = 0
-
-    # Merge similar adjacent superpixels via Region Adjacency Graph
-    rag = rag_mean_color(img_float, slic_labels, mode='similarity')
-    markers = cut_threshold(slic_labels, rag, thresh=threshold)
-
-    # Relabel starting from 2 (to match watershed convention: 0=unknown, 1=bg)
-    unique = np.unique(markers)
-    remap = {old: new for new, old in enumerate(unique, start=2)}
-    remap[0] = 0
-    markers = np.vectorize(remap.get)(markers).astype(np.int32)
-
-    # Same output format as segment_teeth_watershed
-    teeth_mask = np.zeros_like(preprocessed_img)
-    teeth_mask[markers > 1] = 255
-    contours, _ = cv2.findContours(teeth_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    return teeth_mask, np.array(contours, dtype=object), markers
-
-
-#! FELZENSZWALB DAJE DZIWNE WYNIKI
-def segment_teeth_felzenszwalb(preprocessed_img, scale=10, sigma=1.5, min_size=50, downscale=2):
-    h, w = preprocessed_img.shape
-    small = cv2.resize(preprocessed_img, (w // downscale, h // downscale))
-    
-    labels = felzenszwalb(small.astype(float) / 255.0, scale=scale, sigma=sigma,
-                        min_size=min_size, channel_axis=None)
-    labels = cv2.resize(labels.astype(float), (w, h), interpolation=cv2.INTER_NEAREST).astype(np.int32)
-
-    _, binary = cv2.threshold(preprocessed_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    labels[binary == 0] = 0
-
-    teeth_mask = np.zeros_like(preprocessed_img)
-    teeth_mask[labels > 0] = 255
-    contours, _ = cv2.findContours(teeth_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    return teeth_mask, np.array(contours, dtype=object), labels
-
-
 def segment_teeth_watershed(preprocessed_img, threshold = 0.1):
     _, binary = cv2.threshold(preprocessed_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (4, 4))
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 15))
+    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 2))
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_close)
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_open)
     sure_bg = cv2.dilate(binary, kernel_close, iterations=1)
 
     # Step 4: Distance transform to find sure foreground (inside teeth)
-    dist_transform = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+    dist_transform = cv2.distanceTransform(binary, cv2.DIST_L1, 5)
     _, sure_fg = cv2.threshold(dist_transform, threshold * dist_transform.max(), 255, 0)
     sure_fg = np.uint8(sure_fg)
 
@@ -267,7 +214,7 @@ def segment_with_voronoi(preprocessed_img, centroids, refine=True, min_area=800,
                 largest = max(contours, key=cv2.contourArea)
                 area = cv2.contourArea(largest)
                 if area > max_area:
-                    print(f"Ząb {tid} obcięty odległością od centroidu: {area:.0f} → {max_area}")
+                    # print(f"Ząb {tid} obcięty odległością od centroidu: {area:.0f} → {max_area}")
 
                     # Tworzymy maskę tylko z największego konturu
                     mask_temp = np.zeros_like(tooth_mask)
@@ -339,7 +286,7 @@ def segment_with_mean_shift(preprocessed_img, centroids, sp=15, sr=30, debug=Fal
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
-    teeth_contours, _ = segment_with_voronoi(shifted_gray, centroids, refine=True, debug=False)
+    teeth_contours, _ = segment_with_voronoi(shifted_gray, centroids, refine=True, debug=False, max_area=10000)
 
     if debug:
         vis = cv2.cvtColor(preprocessed_img, cv2.COLOR_GRAY2BGR)
@@ -351,3 +298,76 @@ def segment_with_mean_shift(preprocessed_img, centroids, sp=15, sr=30, debug=Fal
         plt.show()
 
     return teeth_contours, shifted_gray
+
+
+def segment_with_flood_fill(preprocessed_img, centroids, tolerance=25, debug=False):
+    """
+    Flood Fill z OpenCV - szybka i prosta metoda.
+
+    Zalety:
+    - Bardzo szybka
+    - Prosta implementacja
+    - Kontrola przez tolerancję
+    """
+    h, w = preprocessed_img.shape
+    teeth_contours = {}
+
+    for tid, (cx, cy) in centroids.items():
+        cx, cy = int(cx), int(cy)
+
+        if not (0 <= cx < w and 0 <= cy < h):
+            continue
+
+        # Maska dla flood fill (musi być o 2 większa niż obraz)
+        mask = np.zeros((h + 2, w + 2), np.uint8)
+
+        # Kopia obrazu (floodFill modyfikuje obraz)
+        img_copy = preprocessed_img.copy()
+
+        # Flood fill
+        seed_point = (cx, cy)
+        new_val = 255
+        lo_diff = tolerance  # dolna tolerancja
+        up_diff = tolerance  # górna tolerancja
+
+        try:
+            _, _, mask, _ = cv2.floodFill(
+                img_copy, mask, seed_point, new_val,
+                loDiff=(lo_diff,), upDiff=(up_diff,),
+                flags=cv2.FLOODFILL_MASK_ONLY | (255 << 8)
+            )
+
+            # Wytnij margines z maski
+            result_mask = mask[1:-1, 1:-1]
+
+            # Cleanup
+            # kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            # result_mask = cv2.morphologyEx(result_mask, cv2.MORPH_CLOSE, kernel)
+            # result_mask = cv2.morphologyEx(result_mask, cv2.MORPH_OPEN, kernel)
+
+            contours, _ = cv2.findContours(result_mask, cv2.RETR_EXTERNAL,
+                                            cv2.CHAIN_APPROX_SIMPLE)
+
+            if contours:
+                for cnt in contours:
+                    if cv2.pointPolygonTest(cnt, (float(cx), float(cy)), False) >= 0:
+                        area = cv2.contourArea(cnt)
+                        if 300 < area < 50000:
+                            teeth_contours[tid] = cnt
+                        break
+
+        except Exception as e:
+            continue
+
+    if debug:
+        overlay = cv2.cvtColor(preprocessed_img, cv2.COLOR_GRAY2BGR)
+        for tid, cnt in teeth_contours.items():
+            cv2.drawContours(overlay, [cnt], -1, (0, 255, 0), 2)
+
+        plt.figure(figsize=(12, 8))
+        plt.imshow(overlay)
+        plt.title(f'Flood Fill: {len(teeth_contours)} teeth')
+        plt.axis('off')
+        plt.show()
+
+    return teeth_contours
